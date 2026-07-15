@@ -162,6 +162,76 @@ torch.save(model.state_dict(), model_save_path)
 print(f"Model saved successfully to {model_save_path}!")
 
 
+#instal gradcam
+!pip install grad-cam
+
+
+import torch
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from torchvision import transforms
+from PIL import Image
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+def visualize_gradcam(model, image_path, target_layer):
+    """
+    Generates and displays a Grad-CAM heatmap for a given image.
+    
+    Args:
+        model: Your trained PyTorch ResNet-50 model.
+        image_path: String path to the X-ray image.
+        target_layer: The layer in the model to visualize (typically model.layer4[-1]).
+    """
+    # 1. Load and Preprocess
+    img = Image.open(image_path).convert('RGB')
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    input_tensor = preprocess(img).unsqueeze(0).to(device)
+
+    # 2. Setup Grad-CAM
+    # We use model.eval() to ensure the model behaves correctly during inference
+    model.eval()
+    
+    # Initialize the GradCAM object using 'with' statement (best practice for memory)
+    with GradCAM(model=model, target_layers=[target_layer]) as cam:
+        
+        # 3. Generate the Heatmap
+        # ClassifierOutputTarget(1) targets the PNEUMONIA class specifically
+        targets = [ClassifierOutputTarget(1)]
+        grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
+        grayscale_cam = grayscale_cam[0, :]
+
+        # 4. Overlay and Visualize
+        # Convert image to numpy for the visualization library
+        rgb_img = cv2.resize(np.array(img), (224, 224))
+        rgb_img = np.float32(rgb_img) / 255
+        
+        # Generate the colored overlay
+        visualization = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
+        
+        # Plotting results
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    axes[0].axis('off')
+
+    axes[1].imshow(visualization)
+    axes[1].set_title('Grad-CAM: AI Focus Areas')
+    axes[1].axis('off')
+    plt.show()
+
+# Replace the path below with an actual image file in your Colab files
+# Paste the path you copied inside the quotes below!
+image_path = '/content/dataset/chest_xray/test/PNEUMONIA/person100_bacteria_475.jpeg' # Example path
+
+# For ResNet-50, model.layer4[-1] is the standard last convolutional layer
+visualize_gradcam(model, image_path, model.layer4[-1])
+
+
 
 
 
