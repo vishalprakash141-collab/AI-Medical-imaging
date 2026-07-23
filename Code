@@ -11,10 +11,6 @@ print(f"Using device: {device}")
 
 
 
-<br>
-
-
-
 !pip install kaggle
 !mkdir ~/.kaggle
 !cp kaggle.json ~/.kaggle/
@@ -24,10 +20,8 @@ print(f"Using device: {device}")
 print("Dataset downloaded and extracted!")
 
 
-
-
 # Define the root directory where the dataset was extracted
-data_dir = 'dataset/chest_xray' 
+data_dir = 'dataset/chest_xray'
 
 data_transforms = {
     'train': transforms.Compose([
@@ -44,11 +38,11 @@ data_transforms = {
 }
 
 # Load the datasets using ImageFolder (automatically maps folders to class labels)
-image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x]) 
+image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x])
                   for x in ['train', 'val']}
 
 # Create dataloaders to feed the data in batches (e.g., 32 images at a time)
-dataloaders = {x: DataLoader(image_datasets[x], batch_size=32, shuffle=True, num_workers=2) 
+dataloaders = {x: DataLoader(image_datasets[x], batch_size=32, shuffle=True, num_workers=2)
                for x in ['train', 'val']}
 
 dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
@@ -74,6 +68,7 @@ print("Model successfully loaded and modified for 2 classes!")
 
 
 
+
 # CrossEntropyLoss is standard for classification tasks
 criterion = nn.CrossEntropyLoss()
 
@@ -82,6 +77,7 @@ optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # A learning rate scheduler reduces the learning rate over time to help the model fine-tune
 step_lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+
 
 
 import time
@@ -156,14 +152,14 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=10):
 model = train_model(model, criterion, optimizer, step_lr_scheduler, num_epochs=5)
 
 
+
+
+
 # Save the trained weights
 model_save_path = "chest_xray_resnet50.pth"
 torch.save(model.state_dict(), model_save_path)
 print(f"Model saved successfully to {model_save_path}!")
 
-
-#instal gradcam
-!pip install grad-cam
 
 
 import torch
@@ -179,7 +175,7 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 def visualize_gradcam(model, image_path, target_layer):
     """
     Generates and displays a Grad-CAM heatmap for a given image.
-    
+
     Args:
         model: Your trained PyTorch ResNet-50 model.
         image_path: String path to the X-ray image.
@@ -197,10 +193,10 @@ def visualize_gradcam(model, image_path, target_layer):
     # 2. Setup Grad-CAM
     # We use model.eval() to ensure the model behaves correctly during inference
     model.eval()
-    
+
     # Initialize the GradCAM object using 'with' statement (best practice for memory)
     with GradCAM(model=model, target_layers=[target_layer]) as cam:
-        
+
         # 3. Generate the Heatmap
         # ClassifierOutputTarget(1) targets the PNEUMONIA class specifically
         targets = [ClassifierOutputTarget(1)]
@@ -211,10 +207,10 @@ def visualize_gradcam(model, image_path, target_layer):
         # Convert image to numpy for the visualization library
         rgb_img = cv2.resize(np.array(img), (224, 224))
         rgb_img = np.float32(rgb_img) / 255
-        
+
         # Generate the colored overlay
         visualization = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
-        
+
         # Plotting results
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
     axes[0].axis('off')
@@ -230,6 +226,264 @@ image_path = '/content/dataset/chest_xray/test/PNEUMONIA/person100_bacteria_475.
 
 # For ResNet-50, model.layer4[-1] is the standard last convolutional layer
 visualize_gradcam(model, image_path, model.layer4[-1])
+
+
+
+import os
+import io
+import torch
+import uvicorn
+import nest_asyncio
+import threading
+import time
+import torch.nn.functional as F
+from fastapi import FastAPI, File, UploadFile, Depends, Form
+from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+import google.generativeai as genai
+from PIL import Image
+from torchvision import transforms
+
+# ==========================================
+# 1. DATABASE SETUP (SQLite + SQLAlchemy)
+# ==========================================
+SQLALCHEMY_DATABASE_URL = "sqlite:///./radtriage.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class PatientRecord(Base):
+    __tablename__ = "patients"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_name = Column(String, index=True)
+    prediction = Column(String)
+    confidence = Column(Float)
+    triage_status = Column(String)
+    clinical_note = Column(String)
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ==========================================
+# 2. GEMINI AI SETUP
+# ==========================================
+# TODO: Get a free key from https://aistudio.google.com/
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+
+# ==========================================
+# 3. RESNET-50 AI SETUP (MOCK FOR TESTING)
+# ==========================================
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+class_names = ['NORMAL', 'PNEUMONIA']
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+if 'model' not in locals():
+    print("WARNING: 'model' not found in memory. Using a dummy model for testing the API.")
+    import torchvision.models as models
+    import torch.nn as nn
+    model = models.resnet50()
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, 2)
+    model = model.to(device)
+
+
+# ==========================================
+# 4. FASTAPI APP & ENDPOINTS
+# ==========================================
+app = FastAPI(title="RadTriage API", description="AI Radiology Backend")
+
+@app.post("/analyze-scan/")
+async def analyze_scan(
+    patient_name: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    try:
+        # A. Read the uploaded image
+        image_bytes = await file.read()
+        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+
+        # B. Run ResNet-50 Prediction
+        input_tensor = preprocess(img).unsqueeze(0).to(device)
+        model.eval()
+        with torch.no_grad():
+            outputs = model(input_tensor)
+            probabilities = F.softmax(outputs[0], dim=0)
+
+        confidence, predicted_idx = torch.max(probabilities, 0)
+        confidence_pct = confidence.item() * 100
+        predicted_label = class_names[predicted_idx.item()]
+
+        if confidence_pct < 70.0:
+            triage_status = "UNCERTAIN: Flagged for Human Review"
+        elif predicted_label == 'PNEUMONIA':
+            triage_status = "HIGH PRIORITY"
+        else:
+            triage_status = "LOW PRIORITY"
+
+        # C. Run Gemini AI (UPDATED PROMPT FOR HEALTH ADVICE)
+        prompt = f"""
+        You are an AI medical assistant communicating with a doctor or patient.
+        Patient Name: {patient_name}
+        X-Ray Prediction: {predicted_label}
+        AI Confidence: {confidence_pct:.1f}%
+        Triage Priority: {triage_status}
+
+        Based on this chest X-ray result, please provide:
+        1. A brief 1-2 sentence clinical summary.
+        2. Recommended next steps and health advice (e.g., rest, hydration, taking prescribed antibiotics if pneumonia is suspected, or further testing).
+
+        Format it nicely. Always include a short disclaimer at the end stating that this is AI-generated advice and a physician must be consulted for an official diagnosis.
+        """
+        try:
+            response = gemini_model.generate_content(prompt)
+            clinical_note = response.text
+        except Exception as e:
+            clinical_note = f"Gemini API Error (Check API Key): {str(e)}"
+
+        # D. Save to Database
+        db_record = PatientRecord(
+            patient_name=patient_name,
+            prediction=predicted_label,
+            confidence=confidence_pct,
+            triage_status=triage_status,
+            clinical_note=clinical_note
+        )
+        db.add(db_record)
+        db.commit()
+        db.refresh(db_record)
+
+        return {
+            "status": "success",
+            "record_id": db_record.id,
+            "patient_name": db_record.patient_name,
+            "ai_prediction": db_record.prediction,
+            "confidence": f"{db_record.confidence:.2f}%",
+            "triage_status": db_record.triage_status,
+            "gemini_clinical_note": db_record.clinical_note
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/patients/")
+def get_patients(db: Session = Depends(get_db)):
+    return db.query(PatientRecord).all()
+
+# ==========================================
+# 5. BULLETPROOF SERVER START
+# ==========================================
+nest_asyncio.apply()
+
+if 'server_thread' not in locals() or not server_thread.is_alive():
+    def run_server():
+        print("Starting uvicorn server...")
+        try:
+            uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+        except Exception as e:
+            print(f"Uvicorn server crashed: {e}")
+
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+
+    print("Waiting 3 seconds for server to initialize...")
+    time.sleep(3)
+    print("🚀 FastAPI Server background thread started! You can now run the test cell.")
+else:
+    print("✅ FastAPI Server is already running in the background.")
+
+
+import requests
+import os
+
+# --- 1. SET YOUR PATH HERE ---
+# Click the folder icon on the left, right-click an image, and select "Copy path"
+file_path = '/content/dataset/chest_xray/test/PNEUMONIA/person100_bacteria_475.jpeg'
+
+if not os.path.exists(file_path):
+    print(f"ERROR: Could not find the file at: {file_path}")
+    print("Please check the path in the sidebar (📁) and update the variable.")
+else:
+    try:
+        # 2. Test the connection
+        print("Sending request to server...")
+        url = 'http://127.0.0.1:8000/analyze-scan/'
+
+        with open(file_path, 'rb') as f:
+            files = {'file': f}
+            data = {'patient_name': 'John Doe'}
+            response = requests.post(url, files=files, data=data)
+
+        print("\n--- API RESPONSE ---")
+        print(response.json())
+
+        # 3. Check Database
+        db_check = requests.get('http://127.0.0.1:8000/patients/')
+        print("\n--- DATABASE RECORDS ---")
+        print(db_check.json())
+
+    except requests.exceptions.ConnectionError:
+        print("ERROR: Connection Refused. Is the FastAPI cell running?")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+
+import torch
+import torchvision.models as models
+import torch.nn as nn
+
+# 1. Define the exact same model architecture you trained
+print("Loading model architecture...")
+device = torch.device("cpu") # It's usually safer to export on CPU
+model = models.resnet50()
+num_ftrs = model.fc.in_features
+model.fc = nn.Linear(num_ftrs, 2) # 2 classes: NORMAL and PNEUMONIA
+
+# 2. Load your trained weights
+# Make sure the path points to your saved .pth file
+weights_path = 'chest_xray_resnet50.pth'
+print(f"Loading weights from {weights_path}...")
+model.load_state_dict(torch.load(weights_path, map_location=device))
+model.eval() # MUST be in eval mode for export!
+
+# 3. Create a "dummy" input tensor
+# This tells ONNX what shape of data to expect (Batch Size, Channels, Height, Width)
+dummy_input = torch.randn(1, 3, 224, 224, requires_grad=True).to(device)
+
+# 4. Export the model
+onnx_filename = "radtriage_resnet50.onnx"
+print(f"Exporting model to {onnx_filename}...")
+
+# UPDATED: Removed opset_version to let PyTorch use its default/compatible version
+# This prevents the version_converter assertion errors.
+torch.onnx.export(
+    model,                       # model being run
+    dummy_input,                 # model input (or a tuple for multiple inputs)
+    onnx_filename,               # where to save the model
+    export_params=True,          # store the trained parameter weights inside the model file
+    do_constant_folding=True,    # whether to execute constant folding for optimization
+    input_names = ['input'],     # the model's input names
+    output_names = ['output'],   # the model's output names
+    dynamic_axes={'input' : {0 : 'batch_size'},    # variable length axes
+                  'output' : {0 : 'batch_size'}}
+)
+
+print("✅ ONNX export complete! You can now download radtriage_resnet50.onnx from the sidebar.")
+
+
+
+
 
 
 
